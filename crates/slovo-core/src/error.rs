@@ -26,8 +26,17 @@ pub enum Error {
     #[error("dataset error: {0}")]
     Dataset(#[from] slovo_dataset::Error),
 
+    #[error("bad query: {0}")]
+    Query(crate::query_lang::QueryError),
+
     #[error("{0}")]
     Other(String),
+}
+
+impl From<crate::query_lang::QueryError> for Error {
+    fn from(error: crate::query_lang::QueryError) -> Self {
+        Error::Query(error)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

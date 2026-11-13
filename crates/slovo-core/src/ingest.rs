@@ -1,5 +1,6 @@
 //! Ingestion: parse a source file (or directory) and load it into a dataset.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rusqlite::params;
@@ -46,6 +47,8 @@ pub struct ImportStats {
     pub documents: u64,
     pub sentences: u64,
     pub tokens: u64,
+    /// Files already present in the dataset, and therefore not imported again.
+    pub skipped: u64,
 }
 
 /// Import a `.conllu` file, or every `.conllu` file in a directory.
@@ -79,7 +82,15 @@ pub fn import_path(store: &mut Store, opts: &ImportOptions, path: &Path) -> Resu
     }
 
     let mut stats = ImportStats::default();
+    let existing = imported_external_ids(store, corpus_id)?;
+
     for file in &files {
+        let external_id = file.to_string_lossy().to_string();
+        if existing.contains(&external_id) {
+            stats.skipped += 1;
+            continue;
+        }
+
         let (sentences, tokens) = import_file(store, corpus_id, &opts, file)?;
         stats.documents += 1;
         stats.sentences += sentences;
@@ -88,6 +99,23 @@ pub fn import_path(store: &mut Store, opts: &ImportOptions, path: &Path) -> Resu
 
     store.add_token_count(corpus_id, stats.tokens as i64)?;
     Ok(stats)
+}
+
+/// External ids of the documents already in this dataset, so re-importing the
+/// same files is a no-op rather than silently doubling the corpus.
+fn imported_external_ids(store: &Store, corpus_id: i64) -> Result<HashSet<String>> {
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT external_id FROM document WHERE corpus_id = ?1")?;
+    let rows = stmt.query_map(params![corpus_id], |row| row.get::<_, Option<String>>(0))?;
+
+    let mut ids = HashSet::new();
+    for row in rows {
+        if let Some(id) = row? {
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
 }
 
 fn collect_files(path: &Path) -> Result<Vec<PathBuf>> {

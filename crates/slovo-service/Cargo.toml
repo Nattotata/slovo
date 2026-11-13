@@ -1,0 +1,15 @@
+[package]
+name = "slovo-service"
+description = "Service layer: the operations the CLI, the API and future clients share"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+slovo-core = { version = "0.1.0", path = "../slovo-core" }
+slovo-dataset = { version = "0.1.0", path = "../slovo-dataset" }
+slovo-fetch = { version = "0.1.0", path = "../slovo-fetch" }
+
+[dev-dependencies]
+tempfile = "3.27.0"

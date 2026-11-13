@@ -3,6 +3,8 @@ resolver = "2"
 members = [
   "crates/slovo-dataset",
   "crates/slovo-core",
+  "crates/slovo-service",
+  "crates/slovo-server",
   "crates/slovo-fetch",
   "crates/slovo-cli",
 ]

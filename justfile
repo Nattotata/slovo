@@ -33,6 +33,14 @@ check: fmt-check lint test
 run *args:
     cargo run -q -p slovo-cli -- {{args}}
 
+# Query a dataset, e.g. `just query ewt 'take *'`.
+query dataset pattern:
+    cargo run -q -p slovo-cli -- -d {{dataset}} query '{{pattern}}'
+
+# Short alias for `query`.
+q dataset pattern:
+    cargo run -q -p slovo-cli -- -d {{dataset}} query '{{pattern}}'
+
 # Import a UD treebank as dataset `ewt`, e.g. `just ewt ~/corpora/UD_English-EWT`.
 ewt dir:
     cargo run -q -p slovo-cli -- -d ewt import {{dir}} --language en --description "UD English Web Treebank"
@@ -40,6 +48,10 @@ ewt dir:
 # List the catalog.
 sources:
     cargo run -q -p slovo-cli -- sources
+
+# Serve the HTTP API, e.g. `just serve` or `just serve --port 9000`.
+serve *args:
+    cargo run -q -p slovo-cli -- serve {{args}}
 
 # Download a dataset, e.g. `just fetch ud/UD_English-EWT`.
 fetch id:
@@ -57,11 +69,15 @@ install:
 js-install:
     npm install
 
+# Build the web UI (static) into build/.
+ui-build:
+    npm run build
+
 # Run the Tauri dev server.
 gui-dev: js-install
     npm run tauri dev
 
-# Build the Tauri bundle.
+# Build the Tauri bundle (uses the static adapter).
 gui-build: js-install
     npm run tauri build
 

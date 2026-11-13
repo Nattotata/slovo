@@ -6,7 +6,7 @@ Bring your own text, build a searchable corpus, explore it from a CLI and a GUI.
 Comparable tools: corpora.byu.edu, CQPweb / IMS Corpus Workbench, AntConc.
 Slovo is local-first, Markdown-output, and shares one Rust core between the CLI and the GUI.
 
-**Status:** M0–M1.5 implemented (see §14).
+**Status:** M0–M2 implemented (see §14).
 
 Vocabulary used here is defined in [`GLOSSARY.md`](GLOSSARY.md).
 
@@ -30,27 +30,40 @@ Vocabulary used here is defined in [`GLOSSARY.md`](GLOSSARY.md).
 
 ## 2. Architecture
 
-Both frontends call `slovo-core`.
-The CLI does not shell out; the GUI does not parse the CLI's Markdown.
+`slovo-core` is the engine and knows nothing about HTTP, the network or the CLI.
 
 ```
-slovo-dataset     manifest · catalog types
 slovo-core        store · ingest · query · statistics
-slovo-fetch       catalog · downloader · checksums
 
-  ├── slovo-cli   → `slovo` (core + fetch)
-  └── slovo-tauri → Tauri commands → SvelteKit (core)
+slovo-dataset     manifest · catalog types
+slovo-fetch       catalog · downloader · checksums
+slovo-service     the operations every client shares
+                  └── depends on core + dataset + fetch
+
+slovo-cli         `slovo` — CLI, `serve`                  (frontend: people and scripts)
+slovo-server      HTTP API (axum)                         (frontend: UIs)
 ```
 
-The CLI keeps `--format json` so the same operations are usable from scripts and other languages.
+`slovo-service` exists because "download a catalog entry, then import it" used to be composed inside the CLI, so only the CLI could do it.
+Reads were always fine; writes had leaked into a frontend.
+The API and any later client now share that code.
+
+Two transports, on purpose:
+
+- **Direct.** The CLI calls `slovo-service` in-process. `slovo freq` never needs a server running.
+- **HTTP.** The UI talks to `slovo-server`, so the same UI works in a browser and inside the Tauri shell.
+
+Both emit the same JSON, defined once in `slovo_core::api`, so the CLI's `--format json` and the API cannot drift.
 
 ```
 crates/slovo-dataset/  manifest and catalog types
-crates/slovo-core/     engine
+crates/slovo-core/     engine (no HTTP, no network)
+crates/slovo-service/  service layer
 crates/slovo-fetch/    downloader
+crates/slovo-server/   HTTP API
 crates/slovo-cli/      the `slovo` binary
-src-tauri/             Tauri shell (its own Cargo workspace for now)
 src/                   SvelteKit frontend
+src-tauri/             Tauri shell (its own Cargo workspace for now)
 catalog.json           the default catalog
 ```
 
@@ -119,6 +132,7 @@ Annotation engines: start with rule/dictionary tools (`rust-stemmers`, `unicode-
 Ingest is transactional and per-file.
 If a directory contains a `manifest.json`, its metadata fills in the import options.
 One file becomes one `document`; importing a directory creates one document per `.conllu` file.
+Re-importing the same file is a no-op: documents are matched by `external_id`, so a corpus cannot silently double.
 Multiword tokens (`1-2`) and empty nodes (`5.1`) are skipped.
 
 ---
@@ -165,12 +179,49 @@ Registry: `$SLOVO_DATA_DIR/datasets/<name>.db`, default `~/.local/share/slovo`.
 
 ## 6. Query model
 
-1. Simple searches (v1): terms, wildcards `*` (any tokens) and `?` (one character), case sensitivity.
-2. CQL subset later: `[lemma="take"][upos="ADV"]{0,2}[upos="VERB"]`, quantifiers, structural constraints.
+The query language is a subset of **CQP** (the IMS Corpus Workbench), the de facto standard for corpus queries.
+CQPweb, Sketch Engine and KonText implement the same syntax, so queries copy across.
+The CWB authors reject the name "CQL" because of a collision with a Library of Congress standard; Slovo says CQP.
 
-`take *` is a pattern with an open slot.
-It finds `take`, captures the following token(s), and counts and ranks the matches.
+Nodes and quantifiers:
+
+| Syntax | Meaning |
+|---|---|
+| `[]` | any token |
+| `take` | `[word="take"]` |
+| `[lemma="take"]`, `[upos="NOUN"]` | constraint on an attribute |
+| `?` `*` `+` `{n}` `{n,m}` `{n,}` `{,m}` | zero-or-one / zero-or-more / one-or-more / exactly n / n to m / at least n / up to m |
+| `(...)` `\|` | grouping and alternation |
+| `within N` | cap the match at N tokens |
+
+Quantifiers attach to the preceding node, so `[lemma="take"] []+` is *take* followed by one or more tokens.
+
+Aliases for the common cases:
+
+| You write | Expands to | Meaning |
+|---|---|---|
+| `take` | `[word="take"]` | the word |
+| `_` | `[]` | any single token |
+| `*` | `[]+` | one or more tokens |
+| `NOUN` | `[upos="NOUN"]` | part-of-speech tag |
+
+The rules that keep it unambiguous:
+
+* A quantifier must be **attached**: `[]+`, not `[] +`.
+* A **standalone** `*` is therefore free to mean `[]+`.
+* Whitespace separates nodes, so `take off` is a two-token sequence.
+
+Deliberate deviations from CQP:
+
+* **`*` as an alias.** CQP has no standalone `*`; it is only a postfix quantifier. This is the one piece of BYU-flavoured sugar, and `--explain` always shows the expansion.
+* **Literal attribute values.** In CQP, `[word="take.*"]` is a regular expression. Slovo compares literally; `--regex` is planned.
+* **Case-insensitive by default.** CQP is case-sensitive. Slovo matches on the lower-cased form, like `freq`; `--case-sensitive` opts in. A trailing `%c` is accepted and ignored.
+* **All match lengths are counted.** CQP returns one match per start position. Slovo records every span length up to `within`, so `take *` reports `take off` and `take up with` as separate rows. This is what makes the output a cluster list rather than a list of maximal spans.
+
+`take *` is a cluster query: find `take`, then capture one or more following tokens, and rank the captures.
 It is not substring matching.
+
+Unbounded `[]*` can match almost a whole sentence; `within` (default 5) is the guard.
 
 ---
 
@@ -212,8 +263,8 @@ Datasets
   slovo info -d NAME                  size, token count, license, sources
 
 Search & analysis
-  slovo -d NAME <pattern>             shorthand for `search`        (M2)
-  slovo search -d NAME <pattern>      pattern/wildcard search       (M2)
+  slovo -d NAME <pattern>             shorthand for `query`         (done)
+  slovo query -d NAME <pattern>       pattern search, CQP subset    (done)
   slovo kwic   -d NAME <pattern>      concordance lines             (M3)
   slovo collocates -d NAME <word>     collocates + association scores (M4)
   slovo ngrams -d NAME --size 3       most frequent n-grams         (M4)
@@ -221,29 +272,38 @@ Search & analysis
   slovo compare -d A -d B <pattern>   keyword analysis A vs B       (M4)
   slovo doc    -d NAME <doc-id>       print a source document       (M3)
 
+Query options
+      --explain                       print canonical CQP and exit
+      --case-sensitive                match the surface form
+      --within <N>                    max tokens per match          [default: 5]
+      --min-freq <N>                  drop rarer rows               [default: 1]
+
 Global options
   -d, --dataset <NAME>                dataset, or a path to a .db file
       --format <markdown|json|tsv>    output format                 [default: markdown]
   -n, --limit <N>                     max rows                      [default: 20]
 ```
 
-Implemented: `import`, `datasets`, `info`, `freq`, `sources`, `fetch`, `add`.
+Implemented: `import`, `datasets`, `info`, `freq`, `sources`, `fetch`, `add`, `query` (plus the bare-pattern shorthand).
 
 Quote patterns: `slovo -d movies 'take *'`, or the shell expands `*` to filenames.
 
-Target output for `slovo -d movies 'take *'`:
+Actual output for `slovo -d ewt 'take *'`:
 
 ```markdown
-## `take *` — dataset `movies`
+## `take *` — dataset `ewt`
 
-_200,000,000 tokens · 12,345 distinct matches_
+`take *` → `[word="take"] []+ within 5`
+
+_254,820 tokens · 960 matches · 711 distinct_
 
 | # | match | freq | per million |
-|---|-------|-----:|------------:|
-| 1 | take off | 12,345 | 61.7 |
-| 2 | take up | 9,871 | 49.4 |
-| 3 | take out | 7,654 | 38.3 |
-| 4 | take up with | 421 | 2.1 |
+|--:|:------|-----:|------------:|
+| 1 | take a | 30 | 117.7 |
+| 2 | take care | 27 | 106.0 |
+| 3 | take the | 26 | 102.0 |
+| 4 | take care of | 17 | 66.7 |
+| 5 | take it | 15 | 58.9 |
 ```
 
 `--format json` is the stable contract for the GUI and scripts:
@@ -283,13 +343,21 @@ Never fabricate a URL; print the id when there is none.
 
 ## 11. GUI
 
+The UI is a SvelteKit app that talks to `slovo-server` over HTTP.
+That is the point of the server: the browser and the Tauri shell use one transport, so there is no `invoke`-versus-`fetch` fork, and no logic duplicated per target.
+
+One static build, via `@sveltejs/adapter-static`.
+It is a client-rendered SPA (`ssr = false`), so it needs no Node runtime — it can be served by any static host, bundled into the Tauri shell, or embedded in the `slovo` binary.
+
+Decided: embed the built UI in the Rust binary (PocketBase-style, one process, one port). ⬜ not wired up yet.
+
+Planned views:
+
 - One search box (the CLI query syntax) and a dataset selector.
 - Concordance view: KWIC table with sorting and source links.
 - Side panels: collocates, frequency, collocation graph.
-- Ingest screen: pick files, name the dataset, watch progress via Tauri events.
+- Ingest screen: pick files or a catalog id, and watch progress (needs import jobs).
 - Export the current view as Markdown through the same renderer as the CLI.
-
-Core operations are `#[tauri::command]`s that take and return the same serde structs as `--format json`.
 
 ---
 
@@ -318,10 +386,11 @@ Core operations are `#[tauri::command]`s that take and return the same serde str
 | XML (TEI/XCES) | `quick-xml` |
 | Dates | `time` / `chrono` |
 | HTTP | `ureq` (blocking, rustls) |
+| HTTP server | `axum`, `tokio`, `tower-http` (CORS) |
 | Checksums | `sha2` |
 | Archives | `tar`, `flate2` |
 
-In use: `rusqlite` (bundled), `thiserror`, `dirs`, `clap` (derive), `anyhow`, `serde`, `serde_json`, `ureq`, `sha2`; dev: `tempfile`.
+In use: `rusqlite` (bundled), `thiserror`, `dirs`, `clap` (derive), `anyhow`, `serde`, `serde_json`, `ureq`, `sha2`, `axum`, `tokio`, `tower-http`; dev: `tempfile`, `tower`.
 
 ---
 
@@ -330,10 +399,11 @@ In use: `rusqlite` (bundled), `thiserror`, `dirs`, `clap` (derive), `anyhow`, `s
 - **M0 — Skeleton.** ✅ Cargo workspace, `slovo-core` types, `slovo-cli`.
 - **M1 — Ingest + frequency.** ✅ CoNLL-U importer (`UD_English-EWT`); ⬜ `.txt`/`.vrt` importers. ✅ `slovo freq`.
 - **M1.5 — Downloader.** ✅ `catalog.json` + `slovo sources`/`fetch`/`add`; `slovo-dataset` and `slovo-fetch` crates; manifest-driven import.
-- **M2 — Search + Markdown output.** ⬜ wildcards/phrases; generalize the Markdown renderer to search results.
+- **M2 — Search + Markdown output.** ✅ CQP subset + aliases, `slovo query`, the bare-pattern shorthand, `--explain`, Markdown/JSON/TSV output.
+- **M2.5 — HTTP API.** ✅ `slovo-server` + `slovo serve`; one JSON contract (`slovo_core::api`) shared by the CLI and the API; ✅ `slovo-service` holds the operations clients share. ⬜ auth, pagination, import jobs.
 - **M3 — Concordance + provenance.** ⬜ `slovo kwic`, source links, `slovo doc`.
 - **M4 — Collocations + n-grams.** ⬜ statistics module with logDice.
-- **M5 — GUI.** ⬜ wire Tauri commands to the M2–M4 core; move `src-tauri` into `crates/`.
+- **M5 — GUI.** ⬜ wire the SvelteKit UI to `slovo-server`; decide who serves the UI (Node or the Rust binary); move `src-tauri` into `crates/`.
 - **M6 — Distribution.** ⬜ `cargo-dist`, docs, an example dataset.
 
 Verified: `UD_English-EWT` imports to 254,820 tokens, matching UD's published count.

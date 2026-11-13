@@ -55,3 +55,24 @@ fn imports_a_treebank_and_answers_a_frequency_query() {
     assert_eq!(upos[0].count, 2);
     assert!(upos.iter().any(|r| r.value == "PUNCT" && r.count == 2));
 }
+
+#[test]
+fn re_importing_the_same_file_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sample.db");
+    let src = dir.path().join("sample.conllu");
+    std::fs::write(&src, FIXTURE).unwrap();
+
+    let mut store = Store::open(&db).unwrap();
+    let opts = ingest::ImportOptions::new("sample");
+
+    let first = ingest::import_path(&mut store, &opts, &src).unwrap();
+    assert_eq!(first.documents, 1);
+    assert_eq!(first.skipped, 0);
+    assert_eq!(store.token_count().unwrap(), 8);
+
+    let second = ingest::import_path(&mut store, &opts, &src).unwrap();
+    assert_eq!(second.documents, 0);
+    assert_eq!(second.skipped, 1);
+    assert_eq!(store.token_count().unwrap(), 8, "corpus must not double");
+}

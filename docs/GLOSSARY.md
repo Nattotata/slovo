@@ -160,13 +160,33 @@ The integer index of a token in the corpus, in reading order.
 In Slovo this is `token.id`.
 Everything about concordance and windows reduces to arithmetic on positions.
 
-**CQL / CQP syntax**
-Corpus Query Language, the query syntax of CWB and Sketch Engine.
-Conditions in brackets, quantifiers after them:
-`[lemma="take"][upos="ADV"]{0,2}[upos="VERB"]`
-means "a lemma *take*, followed within 0–2 adverbs by a verb".
-It has been the de facto standard for decades; Slovo plans a subset rather than inventing a language.
-Note the name collision: CQL also denotes a completely unrelated Library of Congress query language, and the CWB authors prefer "CQP syntax" for this one.
+**CQP / CQL**
+CQP is the **Corpus Query Processor**, the query tool in the IMS Corpus Workbench (CWB).
+Its query language is usually called CQL, though the CWB authors reject that name because it collides with a Library of Congress standard; Slovo says CQP.
+It has been the de facto standard for decades, and CQPweb, Sketch Engine and KonText all implement it.
+Slovo implements a subset, plus a few aliases.
+
+**Node**
+One token constraint in a CQP query, in square brackets: `[word="take"]`, `[lemma="take"]`, `[upos="NOUN"]`, or `[]` for any token.
+A query is a sequence of nodes, so `[lemma="take"] []+` is *take* followed by one or more tokens.
+
+**Quantifier**
+A symbol after a node giving how many times it repeats: `?` (zero or one), `*` (zero or more), `+` (one or more), `{n}` (exactly n), `{n,m}` (n to m), `{n,}` (at least n), `{,m}` (up to m).
+It attaches to its node: `[]+`, not `[] +`.
+
+**within**
+A CQP clause capping how far a match may reach: `"give" []* "up" within 7`.
+Without it, an unbounded `[]*` can swallow a whole sentence, which the CWB manual explicitly warns about; Slovo defaults to `within 5`.
+
+**Cluster**
+A contiguous run of words, usually listed as "the most frequent 2–5 word strings starting with X".
+`take *` is a cluster query.
+BYU calls these *clusters*; elsewhere they are just n-grams.
+
+**Alias** (in Slovo)
+Shorthand that expands to CQP before parsing: `take` → `[word="take"]`, `_` → `[]`, `*` → `[]+`, `NOUN` → `[upos="NOUN"]`.
+`slovo query --explain '<pattern>'` prints the expansion.
+`*` is the one place Slovo follows BYU rather than CQP: CQP has no standalone `*`.
 
 **TEI** / **XCES**
 XML schemas for encoding texts and corpus annotation.

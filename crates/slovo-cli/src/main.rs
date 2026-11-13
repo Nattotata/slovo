@@ -6,9 +6,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use slovo_core::query::By;
-use slovo_core::{ingest, query, registry, Store};
-
-use render::FreqReport;
+use slovo_core::{ingest, query_lang, search};
+use slovo_service::{AddOptions, Service};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Format {
@@ -132,6 +131,38 @@ enum Command {
         #[arg(long)]
         description: Option<String>,
     },
+
+    /// Search for a token pattern (CQP subset)
+    Query {
+        /// Pattern, e.g. `take *` or `[lemma="take"] []+`
+        pattern: String,
+        /// Print the canonical CQP form and exit
+        #[arg(long)]
+        explain: bool,
+        /// Match on the surface form, not the lower-cased form
+        #[arg(long)]
+        case_sensitive: bool,
+        /// Maximum number of tokens a match may span
+        #[arg(long, value_name = "N", default_value_t = 5)]
+        within: u32,
+        /// Drop rows occurring fewer than this many times
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        min_freq: u64,
+    },
+
+    /// Shorthand: a bare pattern is a query
+    #[command(external_subcommand)]
+    Pattern(Vec<String>),
+
+    /// Serve the HTTP API (for the web UI and the desktop shell)
+    Serve {
+        /// Address to bind
+        #[arg(long, default_value = slovo_server::DEFAULT_HOST)]
+        host: String,
+        /// Port to bind
+        #[arg(long, default_value_t = slovo_server::DEFAULT_PORT)]
+        port: u16,
+    },
 }
 
 fn main() -> Result<()> {
@@ -177,7 +208,55 @@ fn main() -> Result<()> {
             title.clone(),
             description.clone(),
         ),
+        Command::Query {
+            pattern,
+            explain,
+            case_sensitive,
+            within,
+            min_freq,
+        } => cmd_query(&cli, pattern, *explain, *case_sensitive, *within, *min_freq),
+        Command::Pattern(args) => {
+            let pattern = args.join(" ");
+            cmd_query(&cli, &pattern, false, false, 5, 1)
+        }
+        Command::Serve { host, port } => {
+            slovo_server::serve(host, *port).map_err(|error| anyhow::anyhow!("{error}"))?;
+            Ok(())
+        }
     }
+}
+
+fn cmd_query(
+    cli: &Cli,
+    pattern: &str,
+    explain: bool,
+    case_sensitive: bool,
+    within: u32,
+    min_freq: u64,
+) -> Result<()> {
+    if explain {
+        let query = query_lang::parse(pattern)?;
+        let bound = query.within.unwrap_or(within);
+        println!("{}", query_lang::canonical(&query, bound));
+        return Ok(());
+    }
+
+    let name = dataset_name(cli)?;
+    let opts = search::SearchOptions {
+        pattern: pattern.to_string(),
+        limit: cli.limit,
+        case_sensitive,
+        within,
+        min_freq,
+    };
+    let report = Service::new().query(&name, &opts)?;
+
+    match cli.format {
+        Format::Markdown => print!("{}", render::search_markdown(&report)),
+        Format::Tsv => print!("{}", render::search_tsv(&report)),
+        Format::Json => println!("{}", render::search_json(&report)),
+    }
+    Ok(())
 }
 
 fn dataset_name(cli: &Cli) -> Result<String> {
@@ -185,12 +264,6 @@ fn dataset_name(cli: &Cli) -> Result<String> {
         Some(name) => Ok(name.clone()),
         None => bail!("no dataset selected; pass `-d NAME`"),
     }
-}
-
-fn default_download_dir(id: &str) -> PathBuf {
-    registry::data_dir()
-        .join("downloads")
-        .join(id.replace('/', "-"))
 }
 
 fn cmd_import(
@@ -201,9 +274,8 @@ fn cmd_import(
     description: Option<String>,
 ) -> Result<()> {
     let name = dataset_name(cli)?;
-    let db_path = registry::target_path(&name);
-    let mut store =
-        Store::open(&db_path).with_context(|| format!("opening `{}`", db_path.display()))?;
+    let service = Service::new();
+    let db_path = service.registry().target_path(&name);
 
     let opts = ingest::ImportOptions {
         dataset: name.clone(),
@@ -214,7 +286,8 @@ fn cmd_import(
         license: None,
         version: None,
     };
-    let stats = ingest::import_path(&mut store, &opts, path)
+    let stats = service
+        .import(&opts, path)
         .with_context(|| format!("importing `{}`", path.display()))?;
 
     if cli.format == Format::Json {
@@ -224,6 +297,7 @@ fn cmd_import(
             "documents": stats.documents,
             "sentences": stats.sentences,
             "tokens": stats.tokens,
+            "skipped": stats.skipped,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -234,32 +308,32 @@ fn cmd_import(
             render::thousands(stats.tokens),
             name
         );
+        if stats.skipped > 0 {
+            println!(
+                "Skipped {} already-imported document(s).",
+                render::thousands(stats.skipped)
+            );
+        }
         println!("Database: {}", db_path.display());
     }
     Ok(())
 }
 
 fn cmd_datasets(cli: &Cli) -> Result<()> {
-    let mut rows = Vec::new();
-    for name in registry::list()? {
-        let tokens = Store::open_existing(registry::dataset_path(&name))
-            .and_then(|store| store.token_count())
-            .unwrap_or(0);
-        rows.push((name, tokens));
-    }
+    let rows = Service::new().list()?;
 
     match cli.format {
         Format::Json => {
             let list: Vec<_> = rows
                 .iter()
-                .map(|(name, tokens)| serde_json::json!({ "name": name, "tokens": tokens }))
+                .map(|row| serde_json::json!({ "name": row.name, "tokens": row.tokens }))
                 .collect();
             println!("{}", serde_json::to_string_pretty(&list)?);
         }
         Format::Tsv => {
             println!("dataset\ttokens");
-            for (name, tokens) in &rows {
-                println!("{name}\t{tokens}");
+            for row in &rows {
+                println!("{}\t{}", row.name, row.tokens);
             }
         }
         Format::Markdown => {
@@ -271,8 +345,8 @@ fn cmd_datasets(cli: &Cli) -> Result<()> {
                 println!("## Datasets\n");
                 println!("| dataset | tokens |");
                 println!("|:--------|-------:|");
-                for (name, tokens) in &rows {
-                    println!("| {name} | {} |", render::thousands(*tokens));
+                for row in &rows {
+                    println!("| {} | {} |", row.name, render::thousands(row.tokens));
                 }
             }
         }
@@ -282,10 +356,9 @@ fn cmd_datasets(cli: &Cli) -> Result<()> {
 
 fn cmd_info(cli: &Cli) -> Result<()> {
     let name = dataset_name(cli)?;
-    let path = registry::resolve(&name)?;
-    let store = Store::open_existing(&path)?;
-    let info = store.corpus_info()?;
-    let stats = store.stats()?;
+    let service = Service::new();
+    let path = service.registry().resolve(&name)?;
+    let info = service.info(&name)?;
 
     match cli.format {
         Format::Json => {
@@ -293,9 +366,9 @@ fn cmd_info(cli: &Cli) -> Result<()> {
                 "name": info.name,
                 "language": info.language,
                 "description": info.description,
-                "tokens": info.token_count,
-                "documents": stats.documents,
-                "sentences": stats.sentences,
+                "tokens": info.tokens,
+                "documents": info.documents,
+                "sentences": info.sentences,
                 "created_at": info.created_at,
                 "database": path.display().to_string(),
             });
@@ -310,9 +383,9 @@ fn cmd_info(cli: &Cli) -> Result<()> {
             if let Some(description) = &info.description {
                 println!("description\t{description}");
             }
-            println!("tokens\t{}", info.token_count);
-            println!("documents\t{}", stats.documents);
-            println!("sentences\t{}", stats.sentences);
+            println!("tokens\t{}", info.tokens);
+            println!("documents\t{}", info.documents);
+            println!("sentences\t{}", info.sentences);
             println!("created_at\t{}", info.created_at);
             println!("database\t{}", path.display());
         }
@@ -324,9 +397,9 @@ fn cmd_info(cli: &Cli) -> Result<()> {
             if let Some(description) = &info.description {
                 println!("- **description:** {description}");
             }
-            println!("- **tokens:** {}", render::thousands(info.token_count));
-            println!("- **documents:** {}", render::thousands(stats.documents));
-            println!("- **sentences:** {}", render::thousands(stats.sentences));
+            println!("- **tokens:** {}", render::thousands(info.tokens));
+            println!("- **documents:** {}", render::thousands(info.documents));
+            println!("- **sentences:** {}", render::thousands(info.sentences));
             println!("- **created:** {}", info.created_at);
             println!("- **database:** `{}`", path.display());
         }
@@ -336,12 +409,7 @@ fn cmd_info(cli: &Cli) -> Result<()> {
 
 fn cmd_freq(cli: &Cli, by: By) -> Result<()> {
     let name = dataset_name(cli)?;
-    let path = registry::resolve(&name)?;
-    let store = Store::open_existing(&path)?;
-
-    let tokens = store.token_count()?;
-    let rows = query::frequency(&store, by, cli.limit)?;
-    let report = FreqReport::new(&name, by.label(), tokens, &rows);
+    let report = Service::new().frequency(&name, by, cli.limit)?;
 
     match cli.format {
         Format::Markdown => print!("{}", render::freq_markdown(&report)),
@@ -398,7 +466,7 @@ fn cmd_fetch(
     to: Option<PathBuf>,
     force: bool,
 ) -> Result<()> {
-    let to = to.unwrap_or_else(|| default_download_dir(id));
+    let to = to.unwrap_or_else(|| Service::new().registry().download_dir(id));
     let opts = slovo_fetch::FetchOptions {
         catalog,
         id: id.to_string(),
@@ -472,31 +540,25 @@ fn cmd_add(
     description: Option<String>,
 ) -> Result<()> {
     let name = dataset_name(cli)?;
-    let to = to.unwrap_or_else(|| default_download_dir(id));
+    let service = Service::new();
+    let db_path = service.registry().target_path(&name);
 
-    let opts = slovo_fetch::FetchOptions {
-        catalog,
-        id: id.to_string(),
-        to: to.clone(),
-        force,
-    };
-    let manifest = slovo_fetch::fetch(&opts).with_context(|| format!("fetching `{id}`"))?;
+    let outcome = service
+        .add(
+            &name,
+            &AddOptions {
+                source: id.to_string(),
+                catalog,
+                to,
+                force,
+                language,
+                title,
+                description,
+            },
+        )
+        .with_context(|| format!("adding `{id}`"))?;
 
-    let db_path = registry::target_path(&name);
-    let mut store =
-        Store::open(&db_path).with_context(|| format!("opening `{}`", db_path.display()))?;
-
-    let opts = ingest::ImportOptions {
-        dataset: name.clone(),
-        language: language.or(manifest.language),
-        description: description.or(Some(manifest.name.clone())),
-        title: title.or(Some(manifest.name)),
-        source: manifest.source,
-        license: manifest.license,
-        version: manifest.version,
-    };
-    let stats = ingest::import_path(&mut store, &opts, &to)
-        .with_context(|| format!("importing `{}`", to.display()))?;
+    let stats = outcome.stats;
 
     if cli.format == Format::Json {
         let payload = serde_json::json!({
@@ -506,6 +568,8 @@ fn cmd_add(
             "documents": stats.documents,
             "sentences": stats.sentences,
             "tokens": stats.tokens,
+            "skipped": stats.skipped,
+            "directory": outcome.directory.display().to_string(),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
@@ -517,6 +581,12 @@ fn cmd_add(
             id,
             name
         );
+        if stats.skipped > 0 {
+            println!(
+                "Skipped {} already-imported document(s).",
+                render::thousands(stats.skipped)
+            );
+        }
         println!("Database: {}", db_path.display());
     }
     Ok(())
