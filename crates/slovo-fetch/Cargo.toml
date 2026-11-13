@@ -1,0 +1,16 @@
+[package]
+name = "slovo-fetch"
+description = "Downloader for Slovo datasets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sha2 = "0.11.1"
+slovo-dataset = { version = "0.1.0", path = "../slovo-dataset" }
+thiserror = "2.0.21"
+ureq = "3.5.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"

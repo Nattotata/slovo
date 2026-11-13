@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/slovo-dataset",
+  "crates/slovo-core",
+  "crates/slovo-fetch",
+  "crates/slovo-cli",
+]
+exclude = ["src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["David Seidler <reldies.divad@gmail.com>"]
+repository = ""
+
+[profile.release]
+lto = "thin"

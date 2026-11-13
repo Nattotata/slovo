@@ -2,8 +2,13 @@
 name = "slovo"
 version = "0.1.0"
 description = "A Tauri App"
-authors = ["you"]
+authors = ["David Seidler <reldies.divad@gmail.com>"]
+license = "MIT OR Apache-2.0"
 edition = "2021"
+
+# Kept out of the root Cargo workspace (which lives in crates/); the GUI is
+# moved into the workspace later.
+[workspace]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
