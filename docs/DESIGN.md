@@ -478,4 +478,5 @@ Verified: `UD_English-EWT` imports to 254,820 tokens, matching UD's published co
 - Whether to store raw source text by default. `--keep-source` is designed but not implemented.
 - Whether punctuation should be excluded from default frequency lists. It is included now; `.` and `,` rank second and third in EWT.
 - Slovak and Czech need no schema change, but need per-language lemmatization if raw text is added.
+- A `project` dimension for multi-repo docs search is designed but not built; see [`aggregated_md_search.md`](aggregated_md_search.md).
 - `README.md` and this file are the only docs; a `slovo` man page or `--help` examples can wait.

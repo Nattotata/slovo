@@ -335,6 +335,7 @@ src-tauri/             Tauri shell (kept out of the Cargo workspace for now)
 catalog.json           the default catalog
 docs/DESIGN.md         design notes and roadmap
 docs/GLOSSARY.md       linguistic and tooling terms
+docs/aggregated_md_search.md  search over docs aggregated from many repos
 ```
 
 ## Example: a songbook
