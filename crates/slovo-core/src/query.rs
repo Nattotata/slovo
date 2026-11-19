@@ -48,15 +48,45 @@ pub struct FreqRow {
     pub count: u64,
 }
 
-/// The `limit` most frequent values in the dataset.
+/// How to order a frequency list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rank {
+    /// By number of occurrences. The honest count.
+    Frequency,
+    /// By summed structural weight. A *ranking*, not a count: a word in a
+    /// heading outranks one in body text, without its frequency changing.
+    Weight,
+}
+
+impl Rank {
+    /// The SQL aggregate and sort expression.
+    fn score(self) -> (&'static str, &'static str) {
+        match self {
+            // The aggregate is always aliased `n`, so both orderings agree.
+            Rank::Frequency => ("COUNT(*)", "n DESC, value ASC"),
+            Rank::Weight => ("SUM(COALESCE(weight, 1.0))", "n DESC, value ASC"),
+        }
+    }
+}
+
+/// The `limit` most frequent (or highest-ranked) values in the dataset.
 pub fn frequency(store: &Store, by: By, limit: usize) -> Result<Vec<FreqRow>> {
+    frequency_ranked(store, by, limit, Rank::Frequency)
+}
+
+/// A frequency list, ordered by `rank`.
+///
+/// Under [`Rank::Weight`] the `count` is the summed weight, so it is a ranking
+/// score rather than an occurrence count — the caller must label it as such.
+pub fn frequency_ranked(store: &Store, by: By, limit: usize, rank: Rank) -> Result<Vec<FreqRow>> {
     let column = by.column();
+    let (aggregate, order) = rank.score();
     let sql = format!(
-        "SELECT {column} AS value, COUNT(*) AS n
+        "SELECT {column} AS value, {aggregate} AS n
          FROM token
          WHERE {column} IS NOT NULL AND {column} <> ''
          GROUP BY {column}
-         ORDER BY n DESC, value ASC
+         ORDER BY {order}
          LIMIT ?1"
     );
 
@@ -64,7 +94,7 @@ pub fn frequency(store: &Store, by: By, limit: usize) -> Result<Vec<FreqRow>> {
     let rows = stmt.query_map(params![limit as i64], |row| {
         Ok(FreqRow {
             value: row.get(0)?,
-            count: row.get::<_, i64>(1)? as u64,
+            count: row.get::<_, f64>(1)? as u64,
         })
     })?;
 

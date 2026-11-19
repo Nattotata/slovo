@@ -28,7 +28,16 @@ pub const DEFAULT_WITHIN: u32 = 5;
 pub const HARD_MAX_SPAN: usize = 20;
 
 /// Attribute names that can be used inside `[...]`.
-pub const ATTRS: &[&str] = &["word", "form", "lower", "lemma", "upos", "xpos"];
+pub const ATTRS: &[&str] = &[
+    "word",
+    "form",
+    "lower",
+    "lemma",
+    "lemma_override",
+    "upos",
+    "upos_override",
+    "xpos",
+];
 
 /// Universal POS tags, for the bare-tag alias (`NOUN` → `[upos="NOUN"]`).
 pub const UPOS: &[&str] = &[

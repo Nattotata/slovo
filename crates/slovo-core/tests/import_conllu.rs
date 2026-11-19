@@ -76,3 +76,65 @@ fn re_importing_the_same_file_is_a_no_op() {
     assert_eq!(second.skipped, 1);
     assert_eq!(store.token_count().unwrap(), 8, "corpus must not double");
 }
+
+// Two `newdoc` blocks in one file become two documents.
+const MULTIDOC: &str = "\
+# newdoc id = doc-a
+# sent_id = doc-a-1
+# text = The cat sat.
+1\tThe\tthe\tDET\tDT\t_\t2\tdet\t_\t_\n\
+2\tcat\tcat\tNOUN\tNN\t_\t3\tnsubj\t_\t_\n\
+3\tsat\tsit\tVERB\tVBD\t_\t0\troot\t_\t_\n\
+\n\
+# newdoc id = doc-b
+# sent_id = doc-b-1
+# text = Dogs bark.
+1\tDogs\tdog\tNOUN\tNNS\t_\t2\tnsubj\t_\t_\n\
+2\tbark\tbark\tVERB\tVBP\t_\t0\troot\t_\t_\n\
+";
+
+#[test]
+fn a_newdoc_split_creates_one_document_per_source_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("multi.db");
+    let src = dir.path().join("multi.conllu");
+    std::fs::write(&src, MULTIDOC).unwrap();
+
+    let mut store = Store::open(&db).unwrap();
+    let stats =
+        ingest::import_path(&mut store, &ingest::ImportOptions::new("multi"), &src).unwrap();
+    assert_eq!(stats.documents, 2, "one document per newdoc");
+    assert_eq!(stats.sentences, 2);
+
+    let docs = slovo_core::document::documents(&store, 10).unwrap();
+    assert_eq!(docs.len(), 2);
+    assert_eq!(docs[0].title.as_deref(), Some("doc-a"));
+    assert_eq!(docs[1].title.as_deref(), Some("doc-b"));
+    assert_eq!(docs[0].sentences, 1);
+    assert_eq!(docs[0].tokens, 3);
+
+    // The whole first document comes back by id.
+    let doc = slovo_core::document::document(&store, docs[0].id).unwrap();
+    assert_eq!(doc.sentences.len(), 1);
+    assert_eq!(doc.sentences[0].sent_id.as_deref(), Some("doc-a-1"));
+    assert_eq!(doc.sentences[0].text.as_deref(), Some("The cat sat."));
+    assert!(doc.external_id.as_deref().unwrap().ends_with("#doc-a"));
+
+    // Re-importing the same file is still a no-op.
+    let again =
+        ingest::import_path(&mut store, &ingest::ImportOptions::new("multi"), &src).unwrap();
+    assert_eq!(again.documents, 0);
+    assert_eq!(again.skipped, 1);
+    assert_eq!(store.token_count().unwrap(), 5);
+}
+
+#[test]
+fn a_missing_document_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sample.db");
+    let store = Store::open(&db).unwrap();
+    let error = slovo_core::document::document(&store, 999)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("999"), "{error}");
+}

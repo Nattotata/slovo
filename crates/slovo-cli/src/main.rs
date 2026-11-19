@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
-use slovo_core::query::By;
-use slovo_core::{ingest, query_lang, search};
+use slovo_core::query::{By, Rank};
+use slovo_core::{concordance, ingest, query_lang, search};
 use slovo_service::{AddOptions, Service};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -33,6 +33,21 @@ impl From<ByArg> for By {
             ByArg::Lemma => By::Lemma,
             ByArg::Upos => By::Upos,
             ByArg::Xpos => By::Xpos,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum RankArg {
+    Frequency,
+    Weight,
+}
+
+impl From<RankArg> for Rank {
+    fn from(arg: RankArg) -> Self {
+        match arg {
+            RankArg::Frequency => Rank::Frequency,
+            RankArg::Weight => Rank::Weight,
         }
     }
 }
@@ -77,6 +92,44 @@ enum Command {
         /// Free-form description stored with the dataset
         #[arg(long)]
         description: Option<String>,
+        /// Provenance: where the text came from (a URL or a path)
+        #[arg(long)]
+        source: Option<String>,
+        /// Provenance: the source's license, e.g. `CC BY-SA 4.0`
+        #[arg(long)]
+        license: Option<String>,
+    },
+    /// Turn raw text into CoNLL-U (tokenize, split sentences, optional tagger)
+    Annotate {
+        /// Raw text file to read
+        path: PathBuf,
+        /// Where to write CoNLL-U (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Document id prefix for `newdoc`/`sent_id`, e.g. `lotr`
+        #[arg(long)]
+        id: Option<String>,
+        /// An external tagger command that prints CoNLL-U on stdout
+        #[arg(long, value_name = "CMD")]
+        tagger: Option<String>,
+        /// A TSV of form→lemma corrections, applied non-destructively
+        #[arg(long, value_name = "FILE")]
+        lexicon: Option<PathBuf>,
+        /// Read the input as markdown (auto-detected for `.md`)
+        #[arg(long)]
+        markdown: bool,
+        /// Weight scheme for markdown structure: a small `key = value` file
+        #[arg(long, value_name = "FILE")]
+        weights: Option<PathBuf>,
+        /// Keep the parser's head/deprel columns
+        #[arg(long)]
+        parse: bool,
+        /// Split at chapter headings, one document per chapter
+        #[arg(long)]
+        chapters: bool,
+        /// Treat the whole file as one document
+        #[arg(long, conflicts_with = "chapters")]
+        single: bool,
     },
     /// List installed datasets
     Datasets,
@@ -87,6 +140,9 @@ enum Command {
         /// Column to count
         #[arg(long, value_enum, default_value_t = ByArg::Word)]
         by: ByArg,
+        /// Order by occurrence count, or by summed structural weight
+        #[arg(long, value_enum, default_value_t = RankArg::Frequency)]
+        rank: RankArg,
     },
     /// List the datasets in a catalog
     Sources {
@@ -148,7 +204,34 @@ enum Command {
         /// Drop rows occurring fewer than this many times
         #[arg(long, value_name = "N", default_value_t = 1)]
         min_freq: u64,
+        /// Attach up to this many concordance examples to each row
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        examples: usize,
     },
+
+    /// Concordance lines (KWIC) for a token pattern
+    Kwic {
+        /// Pattern, e.g. `take *` or `[lemma="take"] []+`
+        pattern: String,
+        /// Match on the surface form, not the lower-cased form
+        #[arg(long)]
+        case_sensitive: bool,
+        /// Maximum number of tokens a match may span
+        #[arg(long, value_name = "N", default_value_t = 5)]
+        within: u32,
+        /// Tokens of context on each side of the match
+        #[arg(long, value_name = "N", default_value_t = 5)]
+        context: usize,
+    },
+
+    /// Print a source document, by id
+    Doc {
+        /// Document id, as shown in a concordance line
+        id: i64,
+    },
+
+    /// List the documents in a dataset
+    Docs,
 
     /// Shorthand: a bare pattern is a query
     #[command(external_subcommand)]
@@ -173,16 +256,43 @@ fn main() -> Result<()> {
             language,
             title,
             description,
+            source,
+            license,
         } => cmd_import(
             &cli,
             path,
             language.clone(),
             title.clone(),
             description.clone(),
+            source.clone(),
+            license.clone(),
+        ),
+        Command::Annotate {
+            path,
+            output,
+            id,
+            tagger,
+            lexicon,
+            markdown,
+            weights,
+            parse,
+            chapters,
+            single,
+        } => cmd_annotate(
+            path,
+            output.as_deref(),
+            id.clone(),
+            tagger.clone(),
+            lexicon.as_deref(),
+            *markdown,
+            weights.as_deref(),
+            *parse,
+            *chapters,
+            *single,
         ),
         Command::Datasets => cmd_datasets(&cli),
         Command::Info => cmd_info(&cli),
-        Command::Freq { by } => cmd_freq(&cli, (*by).into()),
+        Command::Freq { by, rank } => cmd_freq(&cli, (*by).into(), (*rank).into()),
         Command::Sources { catalog } => cmd_sources(&cli, catalog.clone()),
         Command::Fetch {
             id,
@@ -214,10 +324,27 @@ fn main() -> Result<()> {
             case_sensitive,
             within,
             min_freq,
-        } => cmd_query(&cli, pattern, *explain, *case_sensitive, *within, *min_freq),
+            examples,
+        } => cmd_query(
+            &cli,
+            pattern,
+            *explain,
+            *case_sensitive,
+            *within,
+            *min_freq,
+            *examples,
+        ),
+        Command::Kwic {
+            pattern,
+            case_sensitive,
+            within,
+            context,
+        } => cmd_kwic(&cli, pattern, *case_sensitive, *within, *context),
+        Command::Doc { id } => cmd_doc(&cli, *id),
+        Command::Docs => cmd_docs(&cli),
         Command::Pattern(args) => {
             let pattern = args.join(" ");
-            cmd_query(&cli, &pattern, false, false, 5, 1)
+            cmd_query(&cli, &pattern, false, false, 5, 1, 0)
         }
         Command::Serve { host, port } => {
             slovo_server::serve(host, *port).map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -233,6 +360,7 @@ fn cmd_query(
     case_sensitive: bool,
     within: u32,
     min_freq: u64,
+    examples: usize,
 ) -> Result<()> {
     if explain {
         let query = query_lang::parse(pattern)?;
@@ -248,6 +376,8 @@ fn cmd_query(
         case_sensitive,
         within,
         min_freq,
+        examples,
+        context: slovo_core::KWIC_CONTEXT,
     };
     let report = Service::new().query(&name, &opts)?;
 
@@ -255,6 +385,55 @@ fn cmd_query(
         Format::Markdown => print!("{}", render::search_markdown(&report)),
         Format::Tsv => print!("{}", render::search_tsv(&report)),
         Format::Json => println!("{}", render::search_json(&report)),
+    }
+    Ok(())
+}
+
+fn cmd_kwic(
+    cli: &Cli,
+    pattern: &str,
+    case_sensitive: bool,
+    within: u32,
+    context: usize,
+) -> Result<()> {
+    let name = dataset_name(cli)?;
+    let opts = concordance::KwicOptions {
+        pattern: pattern.to_string(),
+        limit: cli.limit,
+        case_sensitive,
+        within,
+        context,
+    };
+    let report = Service::new().kwic(&name, &opts)?;
+
+    match cli.format {
+        Format::Markdown => print!("{}", render::kwic_markdown(&report)),
+        Format::Tsv => print!("{}", render::kwic_tsv(&report)),
+        Format::Json => println!("{}", render::kwic_json(&report)),
+    }
+    Ok(())
+}
+
+fn cmd_doc(cli: &Cli, id: i64) -> Result<()> {
+    let name = dataset_name(cli)?;
+    let doc = Service::new().document(&name, id)?;
+
+    match cli.format {
+        Format::Markdown => print!("{}", render::doc_markdown(&doc)),
+        Format::Tsv => print!("{}", render::doc_tsv(&doc)),
+        Format::Json => println!("{}", serde_json::to_string_pretty(&doc)?),
+    }
+    Ok(())
+}
+
+fn cmd_docs(cli: &Cli) -> Result<()> {
+    let name = dataset_name(cli)?;
+    let docs = Service::new().documents(&name, cli.limit)?;
+
+    match cli.format {
+        Format::Markdown => print!("{}", render::docs_markdown(&name, &docs)),
+        Format::Tsv => print!("{}", render::docs_tsv(&docs)),
+        Format::Json => println!("{}", serde_json::to_string_pretty(&docs)?),
     }
     Ok(())
 }
@@ -272,6 +451,8 @@ fn cmd_import(
     language: Option<String>,
     title: Option<String>,
     description: Option<String>,
+    source: Option<String>,
+    license: Option<String>,
 ) -> Result<()> {
     let name = dataset_name(cli)?;
     let service = Service::new();
@@ -282,8 +463,8 @@ fn cmd_import(
         language,
         description,
         title,
-        source: None,
-        license: None,
+        source,
+        license,
         version: None,
     };
     let stats = service
@@ -317,6 +498,155 @@ fn cmd_import(
         println!("Database: {}", db_path.display());
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_annotate(
+    path: &Path,
+    output: Option<&Path>,
+    id: Option<String>,
+    tagger: Option<String>,
+    lexicon: Option<&Path>,
+    markdown: bool,
+    weights: Option<&Path>,
+    parse: bool,
+    chapters: bool,
+    single: bool,
+) -> Result<()> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading `{}`", path.display()))?;
+
+    // The id prefix names the documents; default to the file stem.
+    let id_prefix = id.unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("doc")
+            .to_string()
+    });
+
+    // Markdown is opt-in, or detected from the extension.
+    let is_markdown = markdown
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+
+    let scheme = match weights {
+        Some(path) => load_weight_scheme(path)?,
+        None => slovo_annotate::markdown::Scheme::default(),
+    };
+
+    // Markdown: one document per file, one segment per heading section.
+    // Plain text: chapter splitting is opt-in, since plain text has no
+    // guaranteed structure; `--single` forces one document regardless.
+    let segments = if is_markdown {
+        slovo_annotate::markdown::parse(&text, &id_prefix, &scheme).segments
+    } else if chapters && !single {
+        slovo_annotate::segment::split(
+            &text,
+            &slovo_annotate::segment::SplitOptions::new(id_prefix.clone()),
+        )
+    } else {
+        vec![slovo_annotate::Segment::standalone(
+            format!("{id_prefix}-1"),
+            None,
+            text.clone(),
+        )]
+    };
+
+    if segments.is_empty() {
+        bail!("no text found in `{}`", path.display());
+    }
+
+    let mut options = slovo_annotate::Options::new();
+    options.parse = parse;
+    if let Some(command) = tagger {
+        options.tagger = Some(slovo_annotate::tagger::Tagger::new(command));
+    }
+    if let Some(path) = lexicon {
+        let lex = slovo_annotate::lexicon::Lexicon::read(path)
+            .with_context(|| format!("reading lexicon `{}`", path.display()))?;
+        if lex.is_empty() {
+            eprintln!("warning: lexicon `{}` has no entries", path.display());
+        }
+        options.lexicon = Some(lex);
+    }
+
+    let sentences = slovo_annotate::annotate(&segments, &options)?;
+    let conllu = slovo_annotate::conllu::write(&sentences);
+
+    // Distinct documents the run produced (segments may share one).
+    let mut docs: Vec<&str> = segments.iter().map(|s| s.document()).collect();
+    docs.sort_unstable();
+    docs.dedup();
+
+    match output {
+        Some(path) => {
+            std::fs::write(path, &conllu)
+                .with_context(|| format!("writing `{}`", path.display()))?;
+            let tokens: usize = sentences.iter().map(|s| s.tokens.len()).sum();
+            eprintln!(
+                "Annotated {} document(s), {} sentence(s), {} token(s) → {}",
+                docs.len(),
+                sentences.len(),
+                tokens,
+                path.display()
+            );
+        }
+        None => print!("{conllu}"),
+    }
+    Ok(())
+}
+
+/// Load a weight scheme from a small `key = value` file.
+///
+/// Recognised keys: `h1`…`h6`, `body`. An unknown key is an error, so a typo
+/// does not silently fall back to a default.
+fn load_weight_scheme(path: &Path) -> Result<slovo_annotate::markdown::Scheme> {
+    use slovo_annotate::{markdown::Scheme, Weight};
+
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading weight scheme `{}`", path.display()))?;
+
+    let mut scheme = Scheme::default();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            bail!(
+                "{}:{}: expected `key = value`, got `{line}`",
+                path.display(),
+                n + 1
+            );
+        };
+        let key = key.trim().to_lowercase();
+        let value: f64 = value.trim().parse().with_context(|| {
+            format!(
+                "{}:{}: `{}` is not a number",
+                path.display(),
+                n + 1,
+                value.trim()
+            )
+        })?;
+        let weight = Weight::new(value);
+        match key.as_str() {
+            "h1" => scheme.headings[0] = weight,
+            "h2" => scheme.headings[1] = weight,
+            "h3" => scheme.headings[2] = weight,
+            "h4" => scheme.headings[3] = weight,
+            "h5" => scheme.headings[4] = weight,
+            "h6" => scheme.headings[5] = weight,
+            "body" => scheme.body = weight,
+            other => bail!(
+                "{}:{}: unknown weight key `{other}`; expected h1..h6 or body",
+                path.display(),
+                n + 1
+            ),
+        }
+    }
+    Ok(scheme)
 }
 
 fn cmd_datasets(cli: &Cli) -> Result<()> {
@@ -407,9 +737,9 @@ fn cmd_info(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn cmd_freq(cli: &Cli, by: By) -> Result<()> {
+fn cmd_freq(cli: &Cli, by: By, rank: Rank) -> Result<()> {
     let name = dataset_name(cli)?;
-    let report = Service::new().frequency(&name, by, cli.limit)?;
+    let report = Service::new().frequency_ranked(&name, by, cli.limit, rank)?;
 
     match cli.format {
         Format::Markdown => print!("{}", render::freq_markdown(&report)),

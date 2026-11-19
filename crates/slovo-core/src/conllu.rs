@@ -14,7 +14,7 @@ use std::path::Path;
 use crate::error::{Error, Result};
 
 /// One token, as far as Slovo cares about it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub form: String,
     pub lemma: Option<String>,
@@ -23,12 +23,45 @@ pub struct Token {
     pub feats: Option<String>,
     pub head: Option<i64>,
     pub deprel: Option<String>,
+    /// A non-destructive lemma correction, from MISC `LemmaOverride=…`.
+    /// Kept apart from `lemma` so the tagger's output stays inspectable.
+    pub lemma_override: Option<String>,
+    /// A non-destructive UPOS correction, from MISC `UposOverride=…`.
+    pub upos_override: Option<String>,
+    /// Structural ranking weight, from MISC `Weight=…`. `1.0` when absent.
+    pub weight: f64,
+}
+
+impl Default for Token {
+    fn default() -> Self {
+        Self {
+            form: String::new(),
+            lemma: None,
+            upos: None,
+            xpos: None,
+            feats: None,
+            head: None,
+            deprel: None,
+            lemma_override: None,
+            upos_override: None,
+            weight: 1.0,
+        }
+    }
 }
 
 /// One sentence and its tokens, in order.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Sentence {
     pub text: Option<String>,
+    /// The `# sent_id = ...` value, when the file has one.
+    pub sent_id: Option<String>,
+    /// The enclosing `# newdoc id = ...` value, when the file has one.
+    ///
+    /// In UD this marks a document boundary *inside* the file; for EWT it is
+    /// the original web-document id. Slovo uses it for provenance.
+    pub newdoc_id: Option<String>,
+    /// A human-readable document title, from `# newdoc title = ...`.
+    pub newdoc_title: Option<String>,
     pub tokens: Vec<Token>,
 }
 
@@ -46,15 +79,27 @@ pub fn parse_reader<R: BufRead>(reader: R, path: &Path) -> Result<Vec<Sentence>>
     let mut sentences = Vec::new();
     let mut tokens: Vec<Token> = Vec::new();
     let mut text: Option<String> = None;
+    let mut sent_id: Option<String> = None;
+    let mut newdoc_id: Option<String> = None;
+    let mut newdoc_title: Option<String> = None;
 
-    let flush = |tokens: &mut Vec<Token>, text: &mut Option<String>, out: &mut Vec<Sentence>| {
+    let flush = |tokens: &mut Vec<Token>,
+                 text: &mut Option<String>,
+                 sent_id: &mut Option<String>,
+                 newdoc: &Option<String>,
+                 title: &Option<String>,
+                 out: &mut Vec<Sentence>| {
         if !tokens.is_empty() {
             out.push(Sentence {
                 text: text.take(),
+                sent_id: sent_id.take(),
+                newdoc_id: newdoc.clone(),
+                newdoc_title: title.clone(),
                 tokens: std::mem::take(tokens),
             });
         } else {
             *text = None;
+            *sent_id = None;
         }
     };
 
@@ -67,13 +112,39 @@ pub fn parse_reader<R: BufRead>(reader: R, path: &Path) -> Result<Vec<Sentence>>
         let lineno = i + 1;
 
         if line.trim().is_empty() {
-            flush(&mut tokens, &mut text, &mut sentences);
+            flush(
+                &mut tokens,
+                &mut text,
+                &mut sent_id,
+                &newdoc_id,
+                &newdoc_title,
+                &mut sentences,
+            );
             continue;
         }
 
         if let Some(rest) = line.strip_prefix('#') {
-            if let Some(value) = rest.trim().strip_prefix("text =") {
+            let rest = rest.trim();
+            if let Some(value) = rest.strip_prefix("text =") {
                 text = Some(value.trim().to_string());
+            } else if let Some(value) = rest.strip_prefix("sent_id =") {
+                sent_id = Some(value.trim().to_string());
+            } else if let Some(value) = rest.strip_prefix("newdoc id =") {
+                // A new document starts here; close off the previous one.
+                if !tokens.is_empty() {
+                    flush(
+                        &mut tokens,
+                        &mut text,
+                        &mut sent_id,
+                        &newdoc_id,
+                        &newdoc_title,
+                        &mut sentences,
+                    );
+                }
+                newdoc_id = Some(value.trim().to_string());
+                newdoc_title = None;
+            } else if let Some(value) = rest.strip_prefix("newdoc title =") {
+                newdoc_title = Some(value.trim().to_string());
             }
             continue;
         }
@@ -96,6 +167,8 @@ pub fn parse_reader<R: BufRead>(reader: R, path: &Path) -> Result<Vec<Sentence>>
             continue; // multiword token or empty node
         }
 
+        let (lemma_override, upos_override, weight) = parse_misc(cols[9]);
+
         tokens.push(Token {
             form: cols[1].to_string(),
             lemma: opt(cols[2]),
@@ -104,10 +177,20 @@ pub fn parse_reader<R: BufRead>(reader: R, path: &Path) -> Result<Vec<Sentence>>
             feats: opt(cols[5]),
             head: cols[6].parse().ok(),
             deprel: opt(cols[7]),
+            lemma_override,
+            upos_override,
+            weight,
         });
     }
 
-    flush(&mut tokens, &mut text, &mut sentences);
+    flush(
+        &mut tokens,
+        &mut text,
+        &mut sent_id,
+        &newdoc_id,
+        &newdoc_title,
+        &mut sentences,
+    );
     Ok(sentences)
 }
 
@@ -117,6 +200,25 @@ fn opt(value: &str) -> Option<String> {
         "_" | "" => None,
         other => Some(other.to_string()),
     }
+}
+
+/// Pull `LemmaOverride` / `UposOverride` / `Weight` out of a MISC column.
+fn parse_misc(misc: &str) -> (Option<String>, Option<String>, f64) {
+    let mut lemma = None;
+    let mut upos = None;
+    let mut weight = 1.0;
+    for field in misc.split('|') {
+        if let Some(v) = field.strip_prefix("LemmaOverride=") {
+            lemma = Some(v.to_string());
+        } else if let Some(v) = field.strip_prefix("UposOverride=") {
+            upos = Some(v.to_string());
+        } else if let Some(v) = field.strip_prefix("Weight=") {
+            if let Ok(value) = v.parse::<f64>() {
+                weight = value;
+            }
+        }
+    }
+    (lemma, upos, weight)
 }
 
 #[cfg(test)]
@@ -168,9 +270,59 @@ mod tests {
     }
 
     #[test]
+    fn reads_lemma_and_upos_overrides_from_misc() {
+        let sample = "1\the\the\tPRON\tPRP\t_\t2\tnsubj\t_\t_\n\
+                      2\tspake\tspake\tNOUN\tNN\t_\t0\troot\t_\tLemmaOverride=speak|UposOverride=VERB\n";
+        let sentences = parse_reader(sample.as_bytes(), Path::new("<test>")).unwrap();
+        let token = &sentences[0].tokens[1];
+        // The tagger's guess is preserved...
+        assert_eq!(token.lemma.as_deref(), Some("spake"));
+        assert_eq!(token.upos.as_deref(), Some("NOUN"));
+        // ...and the correction sits beside it.
+        assert_eq!(token.lemma_override.as_deref(), Some("speak"));
+        assert_eq!(token.upos_override.as_deref(), Some("VERB"));
+        // A token with no override reads back clean.
+        assert_eq!(sentences[0].tokens[0].lemma_override, None);
+    }
+
+    #[test]
+    fn reads_weight_from_misc_and_defaults_to_one() {
+        let sample = "1\tthe\tthe\tDET\tDT\t_\t_\t_\t_\t_\n\
+                      2\tchorus\tchorus\tNOUN\tNN\t_\t_\t_\t_\tWeight=4\n";
+        let sentences = parse_reader(sample.as_bytes(), Path::new("<test>")).unwrap();
+        assert_eq!(sentences[0].tokens[0].weight, 1.0);
+        assert_eq!(sentences[0].tokens[1].weight, 4.0);
+    }
+
+    #[test]
     fn reports_bad_column_count() {
         let sample = "1\tonly\ttwo\n";
         let err = parse_reader(sample.as_bytes(), Path::new("<test>")).unwrap_err();
         assert!(matches!(err, Error::Conllu { line: 1, .. }));
+    }
+
+    #[test]
+    fn captures_sent_id_and_newdoc() {
+        let sample = "\
+# newdoc id = doc-a
+# sent_id = doc-a-1
+# text = First.
+1\tFirst\tfirst\tADJ\tJJ\t_\t0\troot\t_\t_
+
+# sent_id = doc-a-2
+# text = Second.
+1\tSecond\tsecond\tADJ\tJJ\t_\t0\troot\t_\t_
+
+# newdoc id = doc-b
+# sent_id = doc-b-1
+# text = Third.
+1\tThird\tthird\tADJ\tJJ\t_\t0\troot\t_\t_
+";
+        let sentences = parse_reader(sample.as_bytes(), Path::new("<test>")).unwrap();
+        assert_eq!(sentences.len(), 3);
+        assert_eq!(sentences[0].sent_id.as_deref(), Some("doc-a-1"));
+        assert_eq!(sentences[0].newdoc_id.as_deref(), Some("doc-a"));
+        assert_eq!(sentences[1].newdoc_id.as_deref(), Some("doc-a"));
+        assert_eq!(sentences[2].newdoc_id.as_deref(), Some("doc-b"));
     }
 }

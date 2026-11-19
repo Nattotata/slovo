@@ -30,13 +30,7 @@ fn fixture() -> (tempfile::TempDir, Store) {
 }
 
 fn opts(pattern: &str) -> SearchOptions {
-    SearchOptions {
-        pattern: pattern.to_string(),
-        limit: 20,
-        case_sensitive: false,
-        within: 5,
-        min_freq: 1,
-    }
+    SearchOptions::new(pattern)
 }
 
 #[test]
@@ -150,4 +144,141 @@ fn min_freq_filters_rows() {
 fn a_bad_pattern_is_an_error() {
     let (_dir, store) = fixture();
     assert!(search::search(&store, &opts("[nope=\"x\"]")).is_err());
+}
+
+#[test]
+fn weight_ranking_differs_from_frequency() {
+    use slovo_core::query::By;
+    use slovo_core::query::{frequency_ranked, Rank};
+
+    // Two tokens: `body` twice at weight 1, `title` once at weight 9.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("w.db");
+    let src = dir.path().join("w.conllu");
+    std::fs::write(
+        &src,
+        "1\tbody\tbody\tNOUN\tNN\t_\t_\t_\t_\t_\n\
+         2\tbody\tbody\tNOUN\tNN\t_\t_\t_\t_\t_\n\
+         3\ttitle\ttitle\tNOUN\tNN\t_\t_\t_\t_\tWeight=9\n",
+    )
+    .unwrap();
+
+    let mut store = Store::open(&db).unwrap();
+    ingest::import_path(&mut store, &ingest::ImportOptions::new("w"), &src).unwrap();
+
+    let by_freq = frequency_ranked(&store, By::Word, 10, Rank::Frequency).unwrap();
+    assert_eq!(by_freq[0].value, "body", "frequency counts occurrences");
+    assert_eq!(by_freq[0].count, 2);
+
+    let by_weight = frequency_ranked(&store, By::Word, 10, Rank::Weight).unwrap();
+    assert_eq!(by_weight[0].value, "title", "weight outranks count");
+    assert_eq!(by_weight[0].count, 9);
+    // `body` still appears, at its summed weight of 2.
+    let body = by_weight.iter().find(|r| r.value == "body").unwrap();
+    assert_eq!(body.count, 2);
+}
+
+// The tagger mis-lemmatizes `spake`; a lexicon corrects it in a separate column.
+const OVERRIDE_FIXTURE: &str = "\
+# sent_id = 1
+# text = He spake.
+1\tHe\the\tPRON\tPRP\t_\t2\tnsubj\t_\t_\n\
+2\tspake\tspake\tNOUN\tNN\t_\t0\troot\t_\tLemmaOverride=speak|UposOverride=VERB\n\
+3\t.\t.\tPUNCT\t.\t_\t2\tpunct\t_\t_\n\
+";
+
+fn override_fixture() -> (tempfile::TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("o.db");
+    let src = dir.path().join("o.conllu");
+    std::fs::write(&src, OVERRIDE_FIXTURE).unwrap();
+
+    let mut store = Store::open(&db).unwrap();
+    ingest::import_path(&mut store, &ingest::ImportOptions::new("o"), &src).unwrap();
+    (dir, store)
+}
+
+#[test]
+fn lemma_and_lemma_override_are_separate_layers() {
+    let (_dir, store) = override_fixture();
+
+    // The tagger's lemma is what it is: `spake`.
+    let by_lemma = search::search(&store, &opts("[lemma=\"speak\"]")).unwrap();
+    assert_eq!(by_lemma.matches, 0, "tagger's lemma is spake, not speak");
+    let tagger_guess = search::search(&store, &opts("[lemma=\"spake\"]")).unwrap();
+    assert_eq!(tagger_guess.matches, 1);
+
+    // The correction is a distinct layer.
+    let by_override = search::search(&store, &opts("[lemma_override=\"speak\"]")).unwrap();
+    assert_eq!(by_override.matches, 1);
+    assert_eq!(by_override.rows[0].text, "spake");
+
+    // The surface form is untouched by either layer.
+    let by_word = search::search(&store, &opts("spake")).unwrap();
+    assert_eq!(by_word.matches, 1);
+
+    // UPOS corrections are separate too.
+    assert_eq!(
+        search::search(&store, &opts("[upos=\"NOUN\"]"))
+            .unwrap()
+            .matches,
+        1
+    );
+    assert_eq!(
+        search::search(&store, &opts("[upos_override=\"VERB\"]"))
+            .unwrap()
+            .matches,
+        1
+    );
+}
+
+#[test]
+fn examples_trace_a_row_back_to_its_sentence() {
+    let (_dir, store) = fixture();
+    let result = search::search(
+        &store,
+        &SearchOptions {
+            examples: 3,
+            context: 2,
+            ..opts("take *")
+        },
+    )
+    .unwrap();
+
+    let row = result
+        .rows
+        .iter()
+        .find(|r| r.text == "take up with")
+        .expect("take up with");
+    assert_eq!(row.examples.len(), 1);
+
+    let hit = &row.examples[0];
+    // Sentence 2: "They take up with him."
+    assert_eq!(hit.match_text, "take up with");
+    assert_eq!(hit.left, "They");
+    assert_eq!(hit.right, "him .");
+    assert_eq!(hit.start, 1);
+    assert_eq!(hit.end, 4);
+}
+
+#[test]
+fn examples_are_off_by_default() {
+    let (_dir, store) = fixture();
+    let result = search::search(&store, &opts("take *")).unwrap();
+    assert!(result.rows.iter().all(|r| r.examples.is_empty()));
+}
+
+#[test]
+fn examples_are_capped_per_row() {
+    let (_dir, store) = fixture();
+    let result = search::search(
+        &store,
+        &SearchOptions {
+            examples: 1,
+            ..opts("take _")
+        },
+    )
+    .unwrap();
+    // "take up" occurs in sentence 2 only; but each span keeps at most one hit.
+    assert!(result.rows.iter().all(|r| r.examples.len() <= 1));
 }

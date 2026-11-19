@@ -12,10 +12,13 @@
 
 use std::path::{Path, PathBuf};
 
-use slovo_core::api::{DatasetInfo, DatasetSummary, FreqResponse, SearchResponse};
-use slovo_core::query::By;
+use slovo_core::api::{
+    DatasetInfo, DatasetSummary, DocumentEntry, DocumentSummaryEntry, FreqResponse, KwicResponse,
+    SearchResponse,
+};
+use slovo_core::query::{By, Rank};
 use slovo_core::registry::Registry;
-use slovo_core::{ingest, query, search, Error, Result, Store};
+use slovo_core::{concordance, document, ingest, query, search, Error, Result, Store};
 use slovo_dataset::Manifest;
 use slovo_fetch::FetchOptions;
 
@@ -104,12 +107,23 @@ impl Service {
         })
     }
 
-    /// A frequency list.
-    pub fn frequency(&self, name: &str, by: By, limit: usize) -> Result<FreqResponse> {
+    /// A frequency list, ordered by `rank`.
+    pub fn frequency_ranked(
+        &self,
+        name: &str,
+        by: By,
+        limit: usize,
+        rank: Rank,
+    ) -> Result<FreqResponse> {
         let store = self.open(name)?;
         let tokens = store.token_count()?;
-        let rows = query::frequency(&store, by, limit)?;
-        Ok(FreqResponse::new(name, by.label(), tokens, &rows))
+        let rows = query::frequency_ranked(&store, by, limit, rank)?;
+        Ok(FreqResponse::ranked(name, by.label(), tokens, &rows, rank))
+    }
+
+    /// A frequency list.
+    pub fn frequency(&self, name: &str, by: By, limit: usize) -> Result<FreqResponse> {
+        self.frequency_ranked(name, by, limit, Rank::Frequency)
     }
 
     /// A pattern search.
@@ -117,6 +131,27 @@ impl Service {
         let store = self.open(name)?;
         let result = search::search(&store, options)?;
         Ok(SearchResponse::from_result(name, &result))
+    }
+
+    /// A concordance (KWIC) for a pattern.
+    pub fn kwic(&self, name: &str, options: &concordance::KwicOptions) -> Result<KwicResponse> {
+        let store = self.open(name)?;
+        let result = concordance::kwic(&store, options)?;
+        Ok(KwicResponse::from_result(name, &result))
+    }
+
+    /// One source document, with its sentences.
+    pub fn document(&self, name: &str, document_id: i64) -> Result<DocumentEntry> {
+        let store = self.open(name)?;
+        let doc = document::document(&store, document_id)?;
+        Ok(DocumentEntry::from(&doc))
+    }
+
+    /// The documents in a dataset.
+    pub fn documents(&self, name: &str, limit: usize) -> Result<Vec<DocumentSummaryEntry>> {
+        let store = self.open(name)?;
+        let docs = document::documents(&store, limit)?;
+        Ok(docs.iter().map(DocumentSummaryEntry::from).collect())
     }
 
     /// Import local files into a dataset.

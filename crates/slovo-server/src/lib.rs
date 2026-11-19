@@ -18,8 +18,10 @@ use serde::Deserialize;
 use tower_http::cors::CorsLayer;
 
 use slovo_core::api::{
-    ApiError as ApiErrorBody, DatasetInfo, DatasetSummary, FreqResponse, Health, SearchResponse,
+    ApiError as ApiErrorBody, DatasetInfo, DatasetSummary, DocumentEntry, DocumentSummaryEntry,
+    FreqResponse, Health, KwicResponse, SearchResponse,
 };
+use slovo_core::concordance;
 use slovo_core::query::By;
 use slovo_core::search;
 use slovo_service::Service;
@@ -148,6 +150,12 @@ struct QueryParams {
     min_freq: Option<u64>,
     #[serde(default)]
     case_sensitive: Option<bool>,
+    /// How many concordance examples to attach to each row.
+    #[serde(default)]
+    examples: Option<usize>,
+    /// Tokens of context on each side of an example.
+    #[serde(default)]
+    context: Option<usize>,
 }
 
 async fn get_query(
@@ -160,11 +168,65 @@ async fn get_query(
         case_sensitive: params.case_sensitive.unwrap_or(false),
         within: params.within.unwrap_or(5),
         min_freq: params.min_freq.unwrap_or(1),
+        examples: params.examples.unwrap_or(0),
+        context: params.context.unwrap_or(slovo_core::KWIC_CONTEXT),
     };
 
     let report = blocking(move || Ok(Service::new().query(&name, &options)?)).await?;
 
     Ok(Json(report))
+}
+
+#[derive(Debug, Deserialize)]
+struct KwicParams {
+    pattern: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    within: Option<u32>,
+    #[serde(default)]
+    case_sensitive: Option<bool>,
+    #[serde(default)]
+    context: Option<usize>,
+}
+
+async fn get_kwic(
+    Path(name): Path<String>,
+    Query(params): Query<KwicParams>,
+) -> Result<Json<KwicResponse>, ApiError> {
+    let options = concordance::KwicOptions {
+        pattern: params.pattern,
+        limit: params.limit.unwrap_or(50),
+        case_sensitive: params.case_sensitive.unwrap_or(false),
+        within: params.within.unwrap_or(5),
+        context: params.context.unwrap_or(slovo_core::KWIC_CONTEXT),
+    };
+
+    let report = blocking(move || Ok(Service::new().kwic(&name, &options)?)).await?;
+
+    Ok(Json(report))
+}
+
+async fn get_documents(
+    Path(name): Path<String>,
+    Query(params): Query<DocsParams>,
+) -> Result<Json<Vec<DocumentSummaryEntry>>, ApiError> {
+    let limit = params.limit.unwrap_or(100);
+    let docs = blocking(move || Ok(Service::new().documents(&name, limit)?)).await?;
+    Ok(Json(docs))
+}
+
+async fn get_document(
+    Path((name, id)): Path<(String, i64)>,
+) -> Result<Json<DocumentEntry>, ApiError> {
+    let doc = blocking(move || Ok(Service::new().document(&name, id)?)).await?;
+    Ok(Json(doc))
+}
+
+#[derive(Debug, Deserialize)]
+struct DocsParams {
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// The API routes, without serving them. Handy for tests.
@@ -175,6 +237,9 @@ pub fn router() -> Router {
         .route("/api/datasets/{name}", get(dataset_info))
         .route("/api/datasets/{name}/freq", get(get_freq))
         .route("/api/datasets/{name}/query", get(get_query))
+        .route("/api/datasets/{name}/kwic", get(get_kwic))
+        .route("/api/datasets/{name}/documents", get(get_documents))
+        .route("/api/datasets/{name}/documents/{id}", get(get_document))
         // Permissive so the Vite dev server can call it. Tighten before
         // exposing this beyond the machine.
         .layer(CorsLayer::permissive())

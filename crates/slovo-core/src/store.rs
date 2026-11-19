@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection};
 
 use crate::error::{Error, Result};
-use crate::schema::INIT_SQL;
+use crate::schema::{INIT_SQL, MIGRATIONS, POST_MIGRATION_SQL};
 
 pub struct Store {
     conn: Connection,
@@ -45,6 +45,8 @@ impl Store {
         }
         let conn = Connection::open(&path)?;
         conn.execute_batch(INIT_SQL)?;
+        migrate(&conn)?;
+        conn.execute_batch(POST_MIGRATION_SQL)?;
         Ok(Self { conn, path })
     }
 
@@ -143,5 +145,87 @@ impl Store {
             sentences: count("sentence")?,
             tokens: count("token")?,
         })
+    }
+}
+
+/// Add any columns a dataset file predates. No-op on a fresh file, where
+/// `INIT_SQL` already created every column.
+fn migrate(conn: &Connection) -> Result<()> {
+    for (table, column, definition) in MIGRATIONS {
+        if !column_exists(conn, table, column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_a_pre_v3_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+
+        // Build the v1 tables, without the later columns.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sentence (
+                   id          INTEGER PRIMARY KEY,
+                   document_id INTEGER NOT NULL,
+                   position    INTEGER NOT NULL,
+                   text        TEXT
+                 );
+                 CREATE TABLE token (
+                   id          INTEGER PRIMARY KEY,
+                   sentence_id INTEGER NOT NULL,
+                   position    INTEGER NOT NULL,
+                   form        TEXT NOT NULL,
+                   lower       TEXT NOT NULL,
+                   lemma       TEXT,
+                   upos        TEXT,
+                   xpos        TEXT,
+                   feats       TEXT,
+                   head        INTEGER,
+                   deprel      TEXT
+                 );",
+            )
+            .unwrap();
+        }
+
+        // Opening it migrates in place.
+        let store = Store::open(&path).unwrap();
+        assert!(column_exists(store.conn(), "sentence", "external_id").unwrap());
+        assert!(column_exists(store.conn(), "sentence", "newdoc_id").unwrap());
+        assert!(column_exists(store.conn(), "token", "lemma_override").unwrap());
+        assert!(column_exists(store.conn(), "token", "upos_override").unwrap());
+    }
+
+    #[test]
+    fn a_fresh_file_has_every_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("fresh.db")).unwrap();
+        for (table, column, _) in MIGRATIONS {
+            assert!(
+                column_exists(store.conn(), table, column).unwrap(),
+                "{table}.{column} missing"
+            );
+        }
     }
 }

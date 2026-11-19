@@ -60,6 +60,45 @@ In Slovo, importing a file creates one document; importing a directory creates o
 Linguistic information attached to text: lemmas, POS tags, syntax, and so on.
 An **annotated corpus** is text plus at least one annotation layer.
 
+**Annotation chain**
+The sequence of tools that turn raw text into an annotated corpus:
+segmentation (chapters) → sentence splitting → tokenization → lemmatization →
+POS tagging → parsing.
+Each stage produces one layer; a bad early stage cascades.
+Slovo splits the chain: the mechanical stages live in `slovo-annotate` (plain
+Rust), and the linguistic layers come from an external tagger, so the core
+engine never runs NLP.
+For concordance work the first five stages are enough; parsing is optional.
+
+**Tagger** (in Slovo)
+An external command that reads text on stdin and prints CoNLL-U on stdout, e.g.
+UDPipe or Stanza. Configured with `slovo annotate --tagger "<cmd>"`.
+It supplies lemma and POS; tokenization stays Slovo's, so boundaries are stable.
+Output is **silver** (automatic), not gold — fine for exploring usage, but not
+for publishing per-token accuracy claims, and unreliable on archaic forms.
+
+**Lexicon** (in Slovo)
+A TSV of `form → lemma` corrections (`slovo annotate --lexicon <file>`), for the
+cases a tagger gets wrong — chiefly archaic forms (`spake` → `speak`).
+Applied **non-destructively**: the correction goes to `lemma_override`, and the
+tagger's own `lemma` is left as it was. Both layers stay queryable
+(`[lemma=…]` versus `[lemma_override=…]`), so the model's output remains
+inspectable while the lexicon is built up.
+
+**lemma_override**
+The column a lexicon's correction lands in, kept apart from `lemma`.
+Because it is separate, nothing the tagger produced is lost: `form`, `lemma` and
+`lemma_override` are three layers, and a query chooses which to read.
+
+**Weight** / **structural ranking**
+A per-token number saying how much an occurrence should count when *ranking*,
+derived from where the token sits (a markdown heading, a chapter title).
+It is **not** frequency: `freq` counts occurrences, `freq --rank weight` sums
+weights. A word in a heading outranks one in body text without "occurring more".
+Keeping the two apart matters — folding a weight into a count would make every
+per-million figure downstream wrong. Set by the annotator, stored in the `weight`
+column, carried through CoNLL-U as `Weight=…` in MISC.
+
 **Gold** (gold standard)
 Annotation produced or verified by humans, as opposed to automatically.
 Gold data is small, expensive, and the reference everyone measures against.
@@ -215,6 +254,18 @@ The display convention for concordances: the search term is centered, with a fix
 … I told him to   take   off his coat …
 … the plane will   take   off at noon …
 ```
+`slovo kwic` prints one line per hit this way, each tagged with the document and sentence it came from.
+
+**Concordance hit** / **example**
+One occurrence of a query, with the sentence it sits in.
+A cluster query (`take *`) answers *which* phrases occur; a hit answers *where*, which is what lets a reader decide the meaning — `take off` (depart, undress) versus `take up with` (associate with).
+Slovo records the document id, sentence id and token offsets for every hit, so it can be traced back to its source (`slovo kwic`, or `query --examples N`); `slovo doc -d NAME <id>` prints the whole source document.
+
+**newdoc id** / **document split**
+A CoNLL-U comment, `# newdoc id = ...`, marking where one source text ends and the next begins inside a single file.
+UD uses it for the original document id; in EWT it is a web-document id.
+Slovo turns each `newdoc` block into its own `document`, so a concordance hit names one source text rather than a whole treebank file.
+A file with no `newdoc` comments stays a single document.
 
 **Node** / **collocate**
 Node: the word you are studying.

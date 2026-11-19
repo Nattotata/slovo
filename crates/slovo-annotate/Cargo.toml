@@ -1,0 +1,9 @@
+[package]
+name = "slovo-annotate"
+description = "Raw text to CoNLL-U: the annotation engine, kept out of the core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

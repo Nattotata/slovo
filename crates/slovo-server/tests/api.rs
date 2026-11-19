@@ -58,3 +58,16 @@ async fn query_without_a_pattern_is_a_400() {
     let (status, _) = get("/api/datasets/whatever/query").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn kwic_without_a_pattern_is_a_400() {
+    let (status, _) = get("/api/datasets/whatever/kwic").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn an_unknown_document_is_a_404() {
+    // No dataset is needed: a missing dataset is reported before the document.
+    let (status, _) = get("/api/datasets/whatever/documents/1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

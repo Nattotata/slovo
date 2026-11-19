@@ -86,13 +86,19 @@ pub fn import_path(store: &mut Store, opts: &ImportOptions, path: &Path) -> Resu
 
     for file in &files {
         let external_id = file.to_string_lossy().to_string();
-        if existing.contains(&external_id) {
+        // A file is skipped when any document already derives from it. With
+        // `newdoc` splitting, one file yields `<file>#<newdoc>` ids, so match
+        // on the prefix as well as the exact id.
+        if existing
+            .iter()
+            .any(|id| id == &external_id || id.starts_with(&format!("{external_id}#")))
+        {
             stats.skipped += 1;
             continue;
         }
 
-        let (sentences, tokens) = import_file(store, corpus_id, &opts, file)?;
-        stats.documents += 1;
+        let (documents, sentences, tokens) = import_file(store, corpus_id, &opts, file)?;
+        stats.documents += documents;
         stats.sentences += sentences;
         stats.tokens += tokens;
     }
@@ -145,16 +151,21 @@ fn collect_files(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Insert one file as a single document. Returns `(sentences, tokens)`.
+/// Insert one file as one or more documents. Returns `(documents, sentences, tokens)`.
+///
+/// A UD file may contain several `# newdoc id = ...` blocks. Each block is a
+/// separate source text, so each becomes its own `document` — that is what
+/// makes a concordance hit traceable to the article it came from. A file with
+/// no `newdoc` comments stays a single document.
 fn import_file(
     store: &mut Store,
     corpus_id: i64,
     opts: &ImportOptions,
     path: &Path,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, u64)> {
     let sentences = conllu::parse_file(path)?;
 
-    let title = opts.title.clone().or_else(|| {
+    let file_title = opts.title.clone().or_else(|| {
         path.file_stem()
             .and_then(|s| s.to_str())
             .map(|s| s.to_string())
@@ -167,61 +178,107 @@ fn import_file(
 
     let tx = store.conn_mut().transaction()?;
 
-    let document_id: i64 = tx.query_row(
+    let mut document_stmt = tx.prepare(
         "INSERT INTO document (corpus_id, external_id, title, source_url, license, meta)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          RETURNING id",
-        params![
-            corpus_id,
-            external_id,
-            title.as_deref(),
-            opts.source.as_deref(),
-            opts.license.as_deref(),
-            meta.as_deref(),
-        ],
-        |row| row.get(0),
     )?;
-
     let mut sentence_stmt = tx.prepare(
-        "INSERT INTO sentence (document_id, position, text) VALUES (?1, ?2, ?3) RETURNING id",
+        "INSERT INTO sentence (document_id, position, text, external_id, newdoc_id)
+         VALUES (?1, ?2, ?3, ?4, ?5) RETURNING id",
     )?;
     let mut token_stmt = tx.prepare(
         "INSERT INTO token
-           (sentence_id, position, form, lower, lemma, upos, xpos, feats, head, deprel)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+           (sentence_id, position, form, lower, lemma, upos, xpos, feats, head, deprel,
+            lemma_override, upos_override, weight)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
     )?;
 
+    let mut document_count = 0u64;
     let mut sentence_count = 0u64;
     let mut token_count = 0u64;
 
-    for (i, sentence) in sentences.iter().enumerate() {
-        let sentence_id: i64 = sentence_stmt.query_row(
-            params![document_id, i as i64, sentence.text.as_deref()],
+    // Group consecutive sentences by their `newdoc id`, preserving order.
+    for group in group_by_newdoc(&sentences) {
+        let newdoc = group.first().and_then(|s| s.newdoc_id.clone());
+        let newdoc_title = group.first().and_then(|s| s.newdoc_title.clone());
+
+        // Per-document provenance: the newdoc id names the source text; the
+        // title, when the source gave one, is the human-readable name.
+        let (doc_title, doc_external_id) = match &newdoc {
+            Some(id) => (
+                newdoc_title.or_else(|| Some(id.clone())),
+                format!("{external_id}#{id}"),
+            ),
+            None => (file_title.clone(), external_id.clone()),
+        };
+
+        let document_id: i64 = document_stmt.query_row(
+            params![
+                corpus_id,
+                doc_external_id,
+                doc_title.as_deref(),
+                opts.source.as_deref(),
+                opts.license.as_deref(),
+                meta.as_deref(),
+            ],
             |row| row.get(0),
         )?;
+        document_count += 1;
 
-        for (j, token) in sentence.tokens.iter().enumerate() {
-            token_stmt.execute(params![
-                sentence_id,
-                (j + 1) as i64,
-                &token.form,
-                token.form.to_lowercase(),
-                token.lemma.as_deref(),
-                token.upos.as_deref(),
-                token.xpos.as_deref(),
-                token.feats.as_deref(),
-                token.head,
-                token.deprel.as_deref(),
-            ])?;
+        for (i, sentence) in group.iter().enumerate() {
+            let sentence_id: i64 = sentence_stmt.query_row(
+                params![
+                    document_id,
+                    i as i64,
+                    sentence.text.as_deref(),
+                    sentence.sent_id.as_deref(),
+                    sentence.newdoc_id.as_deref(),
+                ],
+                |row| row.get(0),
+            )?;
+
+            for (j, token) in sentence.tokens.iter().enumerate() {
+                token_stmt.execute(params![
+                    sentence_id,
+                    (j + 1) as i64,
+                    &token.form,
+                    token.form.to_lowercase(),
+                    token.lemma.as_deref(),
+                    token.upos.as_deref(),
+                    token.xpos.as_deref(),
+                    token.feats.as_deref(),
+                    token.head,
+                    token.deprel.as_deref(),
+                    token.lemma_override.as_deref(),
+                    token.upos_override.as_deref(),
+                    token.weight,
+                ])?;
+            }
+
+            sentence_count += 1;
+            token_count += sentence.tokens.len() as u64;
         }
-
-        sentence_count += 1;
-        token_count += sentence.tokens.len() as u64;
     }
 
     drop(token_stmt);
     drop(sentence_stmt);
+    drop(document_stmt);
     tx.commit()?;
 
-    Ok((sentence_count, token_count))
+    Ok((document_count, sentence_count, token_count))
+}
+
+/// Split sentences into runs sharing the same `newdoc id`.
+fn group_by_newdoc(sentences: &[conllu::Sentence]) -> Vec<&[conllu::Sentence]> {
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    for i in 1..=sentences.len() {
+        let boundary = i == sentences.len() || sentences[i].newdoc_id != sentences[start].newdoc_id;
+        if boundary {
+            groups.push(&sentences[start..i]);
+            start = i;
+        }
+    }
+    groups
 }

@@ -41,13 +41,58 @@ query dataset pattern:
 q dataset pattern:
     cargo run -q -p slovo-cli -- -d {{dataset}} query '{{pattern}}'
 
+# Concordance lines, e.g. `just kwic ewt 'take up'`.
+kwic dataset pattern:
+    cargo run -q -p slovo-cli -- -d {{dataset}} kwic '{{pattern}}'
+
+# List a dataset's source documents.
+docs dataset:
+    cargo run -q -p slovo-cli -- -d {{dataset}} docs
+
+# Print a whole source document by id, e.g. `just doc ewt 12`.
+doc dataset id:
+    cargo run -q -p slovo-cli -- -d {{dataset}} doc {{id}}
+
 # Import a UD treebank as dataset `ewt`, e.g. `just ewt ~/corpora/UD_English-EWT`.
 ewt dir:
     cargo run -q -p slovo-cli -- -d ewt import {{dir}} --language en --description "UD English Web Treebank"
 
+# Build the songbook example from examples/songbook/*.md into a local build dir.
+# Safe to re-run from scratch; keeps the dataset out of your real data dir.
+songbook-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src=examples/songbook
+    out="$src/.build"
+    rm -rf "$out"
+    mkdir -p "$out/conllu"
+    for f in "$src"/*.md; do
+      name=$(basename "$f" .md)
+      [ "$name" = "README" ] && continue
+      cargo run -q -p slovo-cli -- annotate "$f" -o "$out/conllu/$name.conllu"
+    done
+    SLOVO_DATA_DIR="$out/data" cargo run -q -p slovo-cli -- -d songs import "$out/conllu" \
+      --language en --source "https://github.com/xof/songbook"
+    echo
+    echo "Dataset 'songs' built in $out/data."
+    echo "Query it with: just songbook kwic 'sleep'  (or docs / doc / freq)"
+
+# Run any slovo command against the songbook example dataset.
+# Usage: just songbook <args…>   e.g. `just songbook kwic 'sleep'`, `just songbook docs`.
+@songbook *args:
+    SLOVO_DATA_DIR=examples/songbook/.build/data cargo run -q -p slovo-cli -- -d songs {{args}}
+
 # List the catalog.
 sources:
     cargo run -q -p slovo-cli -- sources
+
+# Annotate raw text into CoNLL-U, e.g. `just annotate book.txt`.
+annotate *args:
+    cargo run -q -p slovo-cli -- annotate {{args}}
+
+# Annotate a markdown file (weights from its headings).
+md file:
+    cargo run -q -p slovo-cli -- annotate {{file}} -o {{file}}.conllu
 
 # Serve the HTTP API, e.g. `just serve` or `just serve --port 9000`.
 serve *args:
